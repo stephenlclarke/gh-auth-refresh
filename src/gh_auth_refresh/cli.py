@@ -3,23 +3,31 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
+import secrets
+import shlex
 import stat
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 from typing import Any
 
 import jwt
 
 DEFAULT_CONFIG = Path("~/.config/gh-auth-refresh/config.json").expanduser()
 DEFAULT_TOKEN_FILE = Path("~/.secrets/GITHUB_TOKEN").expanduser()
+DEFAULT_PRIVATE_KEY = Path("~/.secrets/gh-auth-refresh-app.pem").expanduser()
+APP_HOME = "https://github.com/stephenlclarke/gh-auth-refresh"
 API_VERSION = "2026-03-10"
 DEFAULT_PERMISSIONS = {"contents": "write", "issues": "write"}
 
@@ -45,7 +53,10 @@ def _json_object(value: str, label: str) -> dict[str, str]:
 
 def _write_private_file(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.parent == Path.home() / ".config" / "gh-auth-refresh":
+    if path.parent in {
+        Path.home() / ".config" / "gh-auth-refresh",
+        Path.home() / ".secrets",
+    }:
         path.parent.chmod(0o700)
     descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temp_path = Path(temp_name)
@@ -109,6 +120,208 @@ def configure(args: argparse.Namespace) -> None:
     print(f"Configuration saved to {config_path}")
     print(f"Discovered App ID {app_id} and installation ID {installation_id}.")
     print("Run 'gh-auth-refresh' to mint and save an installation token.")
+
+
+def _start_manifest_callback() -> tuple[HTTPServer, threading.Thread, threading.Event, dict[str, str]]:
+    received = threading.Event()
+    result: dict[str, str] = {}
+    state = secrets.token_urlsafe(32)
+
+    class CallbackHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path == "/start":
+                page = result.get("setup_page")
+                if not page:
+                    self.send_error(503, "Setup page is not ready")
+                    return
+                body = page.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            query = parse_qs(parsed.query)
+            returned_state = query.get("state", [""])[0]
+            if parsed.path != "/callback" or not secrets.compare_digest(returned_state, state):
+                self.send_error(400, "Invalid GitHub setup callback")
+                return
+            if query.get("error"):
+                result["error"] = query["error"][0]
+            elif query.get("code"):
+                result["code"] = query["code"][0]
+            else:
+                result["error"] = "GitHub did not return a registration code"
+            received.set()
+            body = b"GitHub App registration received. Return to the terminal."
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), CallbackHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    result["state"] = state
+    result["redirect_url"] = f"http://127.0.0.1:{server.server_port}/callback"
+    return server, thread, received, result
+
+
+def _render_manifest_form(state: str, redirect_url: str, permissions: dict[str, str]) -> str:
+    manifest = {
+        "name": f"gh-auth-refresh-{secrets.token_hex(4)}",
+        "url": APP_HOME,
+        "description": "Locally mint short-lived GitHub App tokens for Git and GitHub CLI.",
+        "redirect_url": redirect_url,
+        "public": False,
+        "default_permissions": permissions,
+        "default_events": [],
+    }
+    manifest_value = html.escape(json.dumps(manifest, separators=(",", ":")), quote=True)
+    state_value = html.escape(state, quote=True)
+    page = (
+        "<!doctype html><meta charset=utf-8><title>Set up gh-auth-refresh</title>"
+        "<p>Continue to GitHub to review and approve this pre-filled private App registration.</p>"
+        f'<form action="https://github.com/settings/apps/new?state={state_value}" method="post">'
+        f'<input type="hidden" name="manifest" value="{manifest_value}">'
+        '<button type="submit">Continue to GitHub</button></form>'
+    )
+    return page
+
+
+def _complete_manifest_registration(code: str) -> dict[str, Any]:
+    response = _request_json(
+        f"https://api.github.com/app-manifests/{quote(code, safe='')}/conversions",
+        method="POST",
+        payload={},
+        purpose="App registration completion",
+    )
+    if not isinstance(response, dict):
+        raise RefreshError("GitHub returned an invalid App registration response.")
+    return response
+
+
+def _wait_for_installation(
+    app_id: str,
+    private_key: Path,
+    slug: str,
+    account: str | None,
+) -> str:
+    install_url = f"https://github.com/apps/{quote(slug, safe='')}/installations/new"
+    print("Opening GitHub so you can approve installing the App and select repositories.")
+    if not webbrowser.open(install_url):
+        print(f"Open this URL to continue: {install_url}")
+    print("Waiting for the installation to appear...")
+    deadline = time.monotonic() + 900
+    while time.monotonic() < deadline:
+        assertion = _create_app_assertion(app_id, private_key)
+        installations = _request_json(
+            "https://api.github.com/app/installations?per_page=100",
+            bearer=assertion,
+            purpose="installation lookup",
+        )
+        if not isinstance(installations, list):
+            raise RefreshError("GitHub's installation lookup response was not a list.")
+        app_installations = [
+            item for item in installations if str(item.get("app_id")) == app_id
+        ]
+        matches = app_installations
+        if account:
+            matches = [
+                item for item in matches
+                if str(item.get("account", {}).get("login", "")).casefold() == account.casefold()
+            ]
+        if len(matches) == 1 and isinstance(matches[0].get("id"), int):
+            return str(matches[0]["id"])
+        if len(matches) > 1:
+            accounts = ", ".join(
+                str(item.get("account", {}).get("login", "unknown")) for item in matches
+            )
+            raise RefreshError(
+                "The App is installed on multiple accounts. Re-run configure with "
+                f"--app-slug {slug} --installation-account LOGIN --private-key "
+                f"{shlex.quote(str(private_key))}. Accounts: {accounts}"
+            )
+        if app_installations and account and not matches:
+            accounts = ", ".join(
+                str(item.get("account", {}).get("login", "unknown"))
+                for item in app_installations
+            )
+            raise RefreshError(
+                f"The App is installed on {accounts}, not '{account}'. Re-run configure with "
+                "the account where it was installed."
+            )
+        time.sleep(3)
+    raise RefreshError(
+        "Timed out waiting for installation approval. The App and private key were created; "
+        f"finish at {install_url}, then run configure with --app-slug {slug} "
+        f"--private-key {shlex.quote(str(private_key))}."
+    )
+
+
+def setup(args: argparse.Namespace) -> None:
+    permissions = _json_object(args.permissions, "Permissions")
+    private_key = Path(args.private_key).expanduser()
+    config_path = Path(args.config).expanduser()
+    if private_key.exists():
+        raise RefreshError(
+            f"Refusing to overwrite existing private key {private_key}. Choose another path with --private-key."
+        )
+    if config_path.exists():
+        raise RefreshError(
+            f"Configuration already exists at {config_path}. Use configure to update it, or choose another --config path."
+        )
+    private_key.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if private_key.parent == Path.home() / ".secrets":
+        private_key.parent.chmod(0o700)
+    server, thread, received, callback = _start_manifest_callback()
+    callback["setup_page"] = _render_manifest_form(
+        callback["state"], callback["redirect_url"], permissions
+    )
+    setup_url = f"http://127.0.0.1:{server.server_port}/start"
+    try:
+        print("Opening a pre-filled GitHub App registration. Review and approve it in GitHub.")
+        if not webbrowser.open(setup_url):
+            print(f"Open this local setup page in a browser: {setup_url}")
+        if not received.wait(timeout=600):
+            raise RefreshError("Timed out waiting for GitHub App registration approval.")
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    if callback.get("error"):
+        raise RefreshError(f"GitHub App registration was not completed: {callback['error']}.")
+    app = _complete_manifest_registration(callback["code"])
+    app_id = app.get("id")
+    slug = app.get("slug")
+    pem = app.get("pem")
+    if not isinstance(app_id, int) or not isinstance(slug, str) or not isinstance(pem, str):
+        raise RefreshError("GitHub did not return the App ID, slug, and private key.")
+
+    _write_private_file(private_key, pem)
+    installation_id = _wait_for_installation(
+        str(app_id), private_key, slug, args.installation_account
+    )
+    config = {
+        "app_id": str(app_id),
+        "installation_id": installation_id,
+        "private_key_file": str(private_key.resolve()),
+        "permissions": permissions,
+        "token_file": str(Path(args.token_file).expanduser()),
+    }
+    _write_private_file(config_path, json.dumps(config, indent=2) + "\n")
+    print(f"GitHub App '{slug}' configured (App ID {app_id}, installation ID {installation_id}).")
+    print(f"Private key saved to {private_key}; configuration saved to {config_path}.")
+    refresh(argparse.Namespace(config=str(config_path)))
 
 
 def _config_value(config: dict[str, Any], env_name: str, key: str) -> Any:
@@ -302,6 +515,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--token-file", default=str(DEFAULT_TOKEN_FILE), help="where to save the installation token"
     )
 
+    setup_parser = subparsers.add_parser(
+        "setup", help="create and install a pre-filled GitHub App with your approval"
+    )
+    setup_parser.add_argument(
+        "--installation-account", help="account login to select when installing the App"
+    )
+    setup_parser.add_argument(
+        "--private-key", default=str(DEFAULT_PRIVATE_KEY), help="where to save the generated App PEM key"
+    )
+    setup_parser.add_argument(
+        "--permissions",
+        default=json.dumps(DEFAULT_PERMISSIONS),
+        help='JSON map of requested permissions, e.g. \'{"issues":"write"}\'',
+    )
+    setup_parser.add_argument(
+        "--token-file", default=str(DEFAULT_TOKEN_FILE), help="where to save the installation token"
+    )
+
     return parser
 
 
@@ -311,6 +542,8 @@ def main() -> int:
     try:
         if args.command == "configure":
             configure(args)
+        elif args.command == "setup":
+            setup(args)
         else:
             refresh(args)
     except RefreshError as exc:

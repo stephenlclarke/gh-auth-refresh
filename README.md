@@ -4,10 +4,6 @@ Headlessly mint and install a short-lived GitHub App installation token for GitH
 
 The utility uses a GitHub App's private key to request a new installation token, then atomically writes it to `~/.secrets/GITHUB_TOKEN` with owner-only permissions. It never prints the token. It uses Python and runs on macOS and Linux.
 
-## Before the first refresh
-
-You will need a GitHub App that you own, installed on the account or repositories it should access, and its generated private-key PEM file. GitHub requires the owner to confirm App creation and installation once. The numeric App ID and installation ID are discovered automatically from the App slug and key; you do not need to look up or guess those numbers.
-
 ## Install
 
 Clone the repository and run the installer:
@@ -20,25 +16,23 @@ cd gh-auth-refresh
 
 The installer creates an isolated Python virtual environment under `~/.local/share/gh-auth-refresh`, installs the command and its dependencies, and links `gh-auth-refresh` into `~/bin`. Set `GH_AUTH_REFRESH_BIN_DIR` before running the installer to choose another bin directory.
 
-## One-time GitHub App setup
+## Set up the GitHub App once
 
-GitHub requires the account owner to create and install an app and grant its permissions. That approval cannot be automated away. After setup, token refreshes run without a browser.
-
-1. Create a GitHub App under [Settings → Developer settings → GitHub Apps](https://github.com/settings/apps/new). GitHub requires the account owner to confirm this one-time app registration and installation.
-2. Grant only the permissions you need. For GitHub issues and Git over HTTPS, `Issues: write` and `Contents: write` are a typical starting point. Install the app on the repositories it should access.
-3. Generate a private key for the app and save it somewhere private, for example `~/.secrets/gh-auth-refresh-app.pem`.
-4. Copy the **App slug** from the settings page URL (`https://github.com/settings/apps/APP_SLUG`) and configure it with the private key:
+Run the guided setup:
 
 ```sh
-gh-auth-refresh configure \
-  --app-slug APP_SLUG \
-  --installation-account YOUR_GITHUB_LOGIN \
-  --private-key ~/.secrets/gh-auth-refresh-app.pem
+gh-auth-refresh setup
 ```
 
-Replace `APP_SLUG` with the part after `/settings/apps/` and `YOUR_GITHUB_LOGIN` with the account where you installed the app. The command discovers the numeric App ID and installation ID through GitHub's [App lookup](https://docs.github.com/en/rest/apps/apps#get-an-app) and [installation listing](https://docs.github.com/en/rest/apps/apps#list-installations-for-the-authenticated-app) endpoints, then saves them in `~/.config/gh-auth-refresh/config.json` with owner-only permissions. If the app is installed only once, `--installation-account` can be omitted. If automatic App lookup is unavailable, use `--app-id` and `--installation-id` with the numbers shown in the app settings and installation URL.
+The command prepares a private GitHub App registration with the required settings, then opens GitHub for your approval. After registration, it opens the installation page; choose the account and repositories the App may access and approve installation. The command then detects the App and installation IDs, saves the generated private key to `~/.secrets/gh-auth-refresh-app.pem`, writes the configuration file, and mints the first token. You do not need to enter App details, find an App slug, or copy numeric IDs.
 
-The configure command itself is headless. The default requested token permissions are `contents:write` and `issues:write`; use `--permissions '{"issues":"write"}'` to request a narrower token when you do not need Git access. The private-key file is restricted to owner access.
+Setup uses the browser only for these two GitHub approvals. Refreshing tokens and using Git afterward do not open a browser.
+
+GitHub requires your approval for registration and installation. The setup command creates a private App owned by your account, with a unique name and `Contents: write` and `Issues: write` permissions. During installation, limit it to the repositories where you need Git or issue access. The generated PEM and configuration are saved with owner-only permissions. Use `--permissions '{"issues":"write"}'` if the App only needs to create and update issues.
+
+This is why setup differs from installing Codex or SonarQube: those publishers register and operate their Apps centrally, while this local utility needs its own private key to mint tokens on your laptop. The key is returned by GitHub directly to the local setup process; it is not sent to this repository or a hosted service.
+
+If setup cannot detect the installation before timing out, it keeps the generated key and prints a `configure` command to finish later. To use an App you already own, `gh-auth-refresh configure` remains available; it discovers the numeric IDs from the App slug and private key.
 
 ## Refresh
 
