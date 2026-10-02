@@ -16,6 +16,14 @@ cd gh-auth-refresh
 
 The installer creates an isolated Python virtual environment under `~/.local/share/gh-auth-refresh`, installs the command and its dependencies, and links `gh-auth-refresh` into `~/bin`. Set `GH_AUTH_REFRESH_BIN_DIR` before running the installer to choose another bin directory.
 
+To refresh credentials automatically for GitHub CLI and HTTPS Git commands, install or rerun with:
+
+```sh
+GH_AUTH_REFRESH_INSTALL_GH_WRAPPER=1 ./install.sh
+```
+
+This installs a `~/bin/gh` wrapper ahead of Homebrew's `gh`. Before each authenticated `gh` command, it checks the saved token's expiry, refreshes it when fewer than five minutes remain, replaces any stale `GH_TOKEN` or `GITHUB_TOKEN` inherited by Codex, then runs the original GitHub CLI. It also updates an existing GitHub HTTPS credential helper that calls `gh auth git-credential` to use the wrapper. The installer leaves any existing non-gh-auth-refresh `~/bin/gh` untouched and stops with an error rather than replacing it. Omit the environment setting to install only `gh-auth-refresh` without changing command resolution.
+
 ## Set up the GitHub App once
 
 Run the guided setup:
@@ -36,13 +44,15 @@ If setup cannot detect the installation before timing out, it keeps the generate
 
 ## Refresh
 
-Run this before GitHub work:
+Run this to force a fresh token:
 
 ```sh
 gh-auth-refresh
 ```
 
-It requests a fresh installation token and atomically replaces `~/.secrets/GITHUB_TOKEN`. The token is short-lived (typically one hour). If your shell or Codex was already running with an older `GITHUB_TOKEN`, start a new shell or restart Codex so it loads the updated file. A child process cannot change its parent process's environment.
+It requests a fresh installation token and atomically replaces `~/.secrets/GITHUB_TOKEN`. The token is short-lived (typically one hour). Without the optional wrapper, a shell or Codex process that already has an older `GITHUB_TOKEN` keeps that value; start a new shell or restart Codex to load the updated file. A child process cannot change its parent process's environment.
+
+If you installed the optional `gh` wrapper, you do not need to run this manually before `gh` or Git HTTPS operations; the wrapper handles expiry and passes the current token to each command.
 
 The App must be installed on the target repository and have the permissions required by the operation. GitHub Apps cannot act on repositories where they are not installed.
 

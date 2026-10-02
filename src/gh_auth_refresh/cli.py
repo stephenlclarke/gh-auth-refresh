@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -17,6 +18,7 @@ import time
 import urllib.error
 import urllib.request
 import webbrowser
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
@@ -449,7 +451,33 @@ def _mint_token(
 def refresh(args: argparse.Namespace) -> None:
     config_path = Path(args.config).expanduser()
     config = _load_config(config_path)
+    settings = _refresh_settings(config)
+    app_id = settings["app_id"]
+    installation_id = settings["installation_id"]
+    private_key = settings["private_key"]
+    permissions = settings["permissions"]
+    token_file = settings["token_file"]
 
+    token, expires_at = _mint_token(app_id, installation_id, private_key, permissions)
+    if token_file == DEFAULT_TOKEN_FILE:
+        token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        token_file.parent.chmod(0o700)
+    _write_private_file(token_file, token + "\n")
+    config["token_state"] = {
+        "expires_at": expires_at,
+        "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        "app_id": app_id,
+        "installation_id": installation_id,
+        "private_key_file": str(private_key.resolve()),
+        "permissions": permissions,
+        "token_file": str(token_file.resolve()),
+    }
+    _write_private_file(config_path, json.dumps(config, indent=2) + "\n")
+    if not getattr(args, "quiet", False):
+        print(f"GitHub App token written to {token_file} (expires {expires_at}).")
+
+
+def _refresh_settings(config: dict[str, Any]) -> dict[str, Any]:
     app_id = _config_value(config, "GITHUB_APP_ID", "app_id")
     installation_id = _config_value(config, "GITHUB_APP_INSTALLATION_ID", "installation_id")
     private_key_value = _config_value(config, "GITHUB_APP_PRIVATE_KEY_FILE", "private_key_file")
@@ -471,18 +499,88 @@ def refresh(args: argparse.Namespace) -> None:
     if not str(app_id).isdigit() or not str(installation_id).isdigit():
         raise RefreshError("App ID and installation ID must contain digits only.")
 
-    token, expires_at = _mint_token(
-        str(app_id),
-        str(installation_id),
-        Path(str(private_key_value)).expanduser(),
-        permissions,
+    return {
+        "app_id": str(app_id),
+        "installation_id": str(installation_id),
+        "private_key": Path(str(private_key_value)).expanduser(),
+        "permissions": permissions,
+        "token_file": Path(token_file_value).expanduser(),
+    }
+
+
+def ensure_valid_token(args: argparse.Namespace) -> bool:
+    config_path = Path(args.config).expanduser()
+    config = _load_config(config_path)
+    settings = _refresh_settings(config)
+    state = config.get("token_state")
+    token_file = settings["token_file"]
+    try:
+        token = token_file.read_text(encoding="utf-8").strip()
+        expires_at = datetime.fromisoformat(
+            str(state["expires_at"]).replace("Z", "+00:00")
+        ).timestamp()
+        state_matches = (
+            isinstance(state, dict)
+            and state.get("app_id") == settings["app_id"]
+            and state.get("installation_id") == settings["installation_id"]
+            and state.get("private_key_file") == str(settings["private_key"].resolve())
+            and state.get("permissions") == settings["permissions"]
+            and state.get("token_file") == str(token_file.resolve())
+            and state.get("token_sha256") == hashlib.sha256(token.encode("utf-8")).hexdigest()
+        )
+    except (AttributeError, KeyError, OSError, TypeError, ValueError):
+        state_matches = False
+        expires_at = 0
+
+    if state_matches and expires_at > time.time() + 300:
+        return False
+    refresh(argparse.Namespace(config=str(config_path), quiet=True))
+    return True
+
+
+def _real_gh_path() -> Path:
+    wrapper_value = os.environ.get(
+        "GH_AUTH_REFRESH_WRAPPER_PATH", str(Path.home() / "bin" / "gh")
     )
-    token_file = Path(token_file_value).expanduser()
-    if token_file == DEFAULT_TOKEN_FILE:
-        token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        token_file.parent.chmod(0o700)
-    _write_private_file(token_file, token + "\n")
-    print(f"GitHub App token written to {token_file} (expires {expires_at}).")
+    wrapper_path = Path(wrapper_value).resolve()
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(directory or ".") / "gh"
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            continue
+        try:
+            if candidate.resolve() == wrapper_path:
+                continue
+        except OSError:
+            continue
+        return candidate
+    raise RefreshError("Could not find the original GitHub CLI after the gh-auth-refresh wrapper.")
+
+
+def run_gh(args: argparse.Namespace) -> None:
+    gh_args = list(args.gh_args)
+    if gh_args and gh_args[0] == "--":
+        gh_args.pop(0)
+    gh_path = _real_gh_path()
+
+    local_commands = {"--help", "-h", "--version", "version", "help", "completion"}
+    needs_auth = bool(gh_args) and gh_args[0] not in local_commands
+    if needs_auth and Path(args.config).expanduser().is_file():
+        ensure_valid_token(args)
+        config = _load_config(Path(args.config).expanduser())
+        settings = _refresh_settings(config)
+        try:
+            token = settings["token_file"].read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise RefreshError(f"Cannot read the refreshed token file {settings['token_file']}.") from exc
+        if not token:
+            raise RefreshError(f"The refreshed token file {settings['token_file']} is empty.")
+        os.environ["GH_TOKEN"] = token
+        os.environ["GITHUB_TOKEN"] = token
+
+    try:
+        os.execv(str(gh_path), [str(gh_path), *gh_args])
+    except OSError as exc:
+        raise RefreshError(f"Could not start GitHub CLI at {gh_path}.") from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -533,6 +631,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--token-file", default=str(DEFAULT_TOKEN_FILE), help="where to save the installation token"
     )
 
+    gh_parser = subparsers.add_parser(
+        "run-gh", add_help=False, help="run GitHub CLI with a refreshed token"
+    )
+    gh_parser.add_argument("gh_args", nargs=argparse.REMAINDER)
+
     return parser
 
 
@@ -544,6 +647,8 @@ def main() -> int:
             configure(args)
         elif args.command == "setup":
             setup(args)
+        elif args.command == "run-gh":
+            run_gh(args)
         else:
             refresh(args)
     except RefreshError as exc:
