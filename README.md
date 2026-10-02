@@ -22,7 +22,7 @@ To refresh credentials automatically for GitHub CLI and HTTPS Git commands, inst
 GH_AUTH_REFRESH_INSTALL_GH_WRAPPER=1 ./install.sh
 ```
 
-This installs a `~/bin/gh` wrapper ahead of Homebrew's `gh`. Before each authenticated `gh` command, it checks the saved token's expiry, refreshes it when fewer than five minutes remain, replaces any stale `GH_TOKEN` or `GITHUB_TOKEN` inherited by Codex, then runs the original GitHub CLI. It also updates an existing GitHub HTTPS credential helper that calls `gh auth git-credential` to use the wrapper. The installer leaves any existing non-gh-auth-refresh `~/bin/gh` untouched and stops with an error rather than replacing it. Omit the environment setting to install only `gh-auth-refresh` without changing command resolution.
+This installs a `~/bin/gh` wrapper ahead of Homebrew's `gh`. By default, it removes inherited `GH_TOKEN` and `GITHUB_TOKEN` values before authenticated commands so the original GitHub CLI uses the saved `gh auth login` account. This avoids accidentally using an App token that cannot access an organisation repository. To explicitly use the configured GitHub App identity for a command, set `GH_AUTH_REFRESH_USE_APP_TOKEN=1`; the wrapper refreshes the token when fewer than five minutes remain and passes it to the CLI. It also updates an existing GitHub HTTPS credential helper that calls `gh auth git-credential` to use the wrapper. The installer leaves any existing non-gh-auth-refresh `~/bin/gh` untouched and stops with an error rather than replacing it. Omit the environment setting to install only `gh-auth-refresh` without changing command resolution.
 
 ## Set up the GitHub App once
 
@@ -52,7 +52,9 @@ gh-auth-refresh
 
 It requests a fresh installation token and atomically replaces `~/.secrets/GITHUB_TOKEN`. The token is short-lived (typically one hour). Without the optional wrapper, a shell or Codex process that already has an older `GITHUB_TOKEN` keeps that value; start a new shell or restart Codex to load the updated file. A child process cannot change its parent process's environment.
 
-If you installed the optional `gh` wrapper, you do not need to run this manually before `gh` or Git HTTPS operations; the wrapper handles expiry and passes the current token to each command.
+If you installed the optional `gh` wrapper, normal `gh` and Git HTTPS operations use your saved `gh auth login` account. To use the App token for a specific command, prefix it with `GH_AUTH_REFRESH_USE_APP_TOKEN=1`.
+
+For example, `GH_AUTH_REFRESH_USE_APP_TOKEN=1 gh issue create` uses the App identity, while `gh issue create` uses your saved user login. Use the App identity only for repositories where the App is installed with the required permissions.
 
 The App must be installed on the target repository and have the permissions required by the operation. GitHub Apps cannot act on repositories where they are not installed.
 

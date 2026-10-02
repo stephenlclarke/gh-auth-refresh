@@ -564,18 +564,29 @@ def run_gh(args: argparse.Namespace) -> None:
 
     local_commands = {"--help", "-h", "--version", "version", "help", "completion"}
     needs_auth = bool(gh_args) and gh_args[0] not in local_commands
-    if needs_auth and Path(args.config).expanduser().is_file():
-        ensure_valid_token(args)
-        config = _load_config(Path(args.config).expanduser())
-        settings = _refresh_settings(config)
-        try:
-            token = settings["token_file"].read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            raise RefreshError(f"Cannot read the refreshed token file {settings['token_file']}.") from exc
-        if not token:
-            raise RefreshError(f"The refreshed token file {settings['token_file']} is empty.")
-        os.environ["GH_TOKEN"] = token
-        os.environ["GITHUB_TOKEN"] = token
+    if needs_auth:
+        # A GitHub App installation token is limited to repositories where the
+        # App is installed. Prefer gh's saved user login by default, and only
+        # opt into the App identity when explicitly requested.
+        use_app_token = os.environ.get("GH_AUTH_REFRESH_USE_APP_TOKEN") == "1"
+        if use_app_token:
+            if Path(args.config).expanduser().is_file():
+                ensure_valid_token(args)
+                config = _load_config(Path(args.config).expanduser())
+                settings = _refresh_settings(config)
+                try:
+                    token = settings["token_file"].read_text(encoding="utf-8").strip()
+                except OSError as exc:
+                    raise RefreshError(
+                        f"Cannot read the refreshed token file {settings['token_file']}."
+                    ) from exc
+                if not token:
+                    raise RefreshError(f"The refreshed token file {settings['token_file']} is empty.")
+                os.environ["GH_TOKEN"] = token
+                os.environ["GITHUB_TOKEN"] = token
+        else:
+            os.environ.pop("GH_TOKEN", None)
+            os.environ.pop("GITHUB_TOKEN", None)
 
     try:
         os.execv(str(gh_path), [str(gh_path), *gh_args])
